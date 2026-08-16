@@ -1,10 +1,26 @@
 # Audiobook Reader
 
-A local-first Android audiobook application skeleton built with Kotlin, Jetpack Compose, Room, DataStore, Media3, and Android TTS abstraction.
+A local-first audiobook reader with a native Android client and a browser client.
+
+## Web app
+
+The web client lives in `web/`. It imports EPUB and text-based PDF files locally, stores the extracted library in IndexedDB, and narrates with voices installed in the browser. Book contents are not uploaded to a server.
+
+Run it locally:
+
+```powershell
+cd web
+npm.cmd install
+npm.cmd run dev
+```
+
+Create a production build with `npm.cmd run build`. The workflow in `.github/workflows/pages.yml` publishes `web/dist` to GitHub Pages. In the repository's **Settings → Pages**, the publishing source must be **GitHub Actions**.
+
+Web limitations: scanned PDFs do not yet use OCR, browser background narration is less reliable than Android foreground playback, and the Web Speech API cannot synthesize reusable audio files.
 
 ## Current status
 
-This project establishes the baseline Android app structure and architecture required for the requested audiobook workflow:
+The Android project establishes the baseline app structure and architecture required for the requested audiobook workflow:
 
 - Android project with Compose UI
 - Material 3 theme
