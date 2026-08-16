@@ -6,7 +6,8 @@ import workerUrl from "pdfjs-dist/build/pdf.worker.min.mjs?url";
 
 pdfjs.GlobalWorkerOptions.workerSrc = workerUrl;
 
-type LangCode = "pl" | "en" | "de" | "fr" | "es" | "it" | "pt" | "nl" | "ru";
+type LangCode = "pl" | "en" | "de" | "fr" | "es" | "it" | "pt" | "nl" | "ru" | "ko";
+type VoiceGenderPreference = "male" | "female" | "none";
 
 type LangSegment = { start: number; end: number; lang: LangCode };
 
@@ -19,6 +20,7 @@ type StoredBook = {
   text: string;
   language: LangCode;
   segments: LangSegment[];
+  segmentVersion?: number;
   position: number;
   importedAt: number;
 };
@@ -34,7 +36,9 @@ let current: StoredBook | null = null;
 let speaking = false;
 let voices: SpeechSynthesisVoice[] = [];
 let selectedVoiceURI: string = localStorage.getItem("voiceSelection") || "auto";
+let voiceGenderPreference = (localStorage.getItem("voiceGenderPreference") as VoiceGenderPreference | null) || "male";
 let keepAliveTimer: number | undefined;
+const SEGMENT_VERSION = 2;
 
 const escapeHtml = (value: string) => value.replace(/[&<>'"]/g, char => ({
   "&": "&amp;", "<": "&lt;", ">": "&gt;", "'": "&#39;", '"': "&quot;"
@@ -46,7 +50,7 @@ const escapeHtml = (value: string) => value.replace(/[&<>'"]/g, char => ({
 
 const LANGUAGE_LABELS: Record<LangCode, string> = {
   pl: "polski", en: "angielski", de: "niemiecki", fr: "francuski",
-  es: "hiszpański", it: "włoski", pt: "portugalski", nl: "niderlandzki", ru: "rosyjski"
+  es: "hiszpański", it: "włoski", pt: "portugalski", nl: "niderlandzki", ru: "rosyjski", ko: "koreański"
 };
 
 const LANGUAGE_PROFILES: Record<LangCode, { stopwords: Set<string>; diacritics?: RegExp }> = {
@@ -81,6 +85,10 @@ const LANGUAGE_PROFILES: Record<LangCode, { stopwords: Set<string>; diacritics?:
   },
   ru: {
     stopwords: new Set(["и", "в", "не", "на", "что", "он", "она", "с", "как", "это", "по", "но", "из", "за", "от", "к", "у", "же"])
+  },
+  ko: {
+    stopwords: new Set(["은", "는", "이", "가", "을", "를", "에", "의", "와", "과", "도", "합니다", "해요"]),
+    diacritics: /[\uac00-\ud7af]/
   }
 };
 
@@ -93,7 +101,8 @@ const LANG_ALIASES: Record<string, LangCode> = {
   ita: "it", it: "it",
   por: "pt", pt: "pt",
   nld: "nl", dut: "nl", nl: "nl",
-  rus: "ru", ru: "ru"
+  rus: "ru", ru: "ru",
+  kor: "ko", ko: "ko"
 };
 
 function normalizeLangCode(raw?: string | null): LangCode | null {
@@ -103,6 +112,8 @@ function normalizeLangCode(raw?: string | null): LangCode | null {
 }
 
 function detectLanguageScored(text: string): { lang: LangCode; score: number } {
+  if (/\p{Script=Hangul}/u.test(text)) return { lang: "ko", score: 100 };
+  if (/\p{Script=Cyrillic}/u.test(text)) return { lang: "ru", score: 100 };
   const words = text.toLowerCase().match(/\p{L}+/gu) || [];
   let best: LangCode = "en";
   let bestScore = 0;
@@ -114,6 +125,35 @@ function detectLanguageScored(text: string): { lang: LangCode; score: number } {
     if (score > bestScore) { bestScore = score; best = code; }
   }
   return { lang: best, score: bestScore };
+}
+
+type ScriptKind = "latin" | "hangul" | "cyrillic";
+
+function scriptOf(char: string): ScriptKind | null {
+  if (/\p{Script=Hangul}/u.test(char)) return "hangul";
+  if (/\p{Script=Cyrillic}/u.test(char)) return "cyrillic";
+  if (/\p{Script=Latin}/u.test(char)) return "latin";
+  return null;
+}
+
+// Script transitions are hard language boundaries even without whitespace or
+// punctuation, e.g. "examen — 교육" and "시험한국의" remain correctly Korean.
+function splitByScript(text: string): { start: number; end: number; text: string; script: ScriptKind | null }[] {
+  const pieces: { start: number; end: number; text: string; script: ScriptKind | null }[] = [];
+  let start = 0;
+  let currentScript: ScriptKind | null = null;
+  for (let index = 0; index < text.length;) {
+    const char = String.fromCodePoint(text.codePointAt(index)!);
+    const script = scriptOf(char);
+    if (script && currentScript && script !== currentScript) {
+      pieces.push({ start, end: index, text: text.slice(start, index), script: currentScript });
+      start = index;
+    }
+    if (script) currentScript = script;
+    index += char.length;
+  }
+  if (text.slice(start).trim()) pieces.push({ start, end: text.length, text: text.slice(start), script: currentScript });
+  return pieces;
 }
 
 // Splits `text` on every match of `boundary`, keeping exact absolute offsets
@@ -139,15 +179,26 @@ function splitByBoundary(text: string, boundary: RegExp): { start: number; end: 
 // (inheriting the paragraph's language) so playback and highlighting can
 // switch voices exactly where the language actually changes.
 function buildSegments(text: string, declared: LangCode | null): { segments: LangSegment[]; dominant: LangCode } {
-  const paragraphs = splitByBoundary(text, /\n{2,}/).map(paragraph => ({
-    ...paragraph,
-    guess: detectLanguageScored(paragraph.text)
-  }));
+  const paragraphs = splitByBoundary(text, /\n{2,}/);
+  const runs = paragraphs.flatMap(paragraph => splitByScript(paragraph.text).map(run => ({
+    ...run,
+    start: paragraph.start + run.start,
+    end: paragraph.start + run.end,
+    guess: detectLanguageScored(run.text)
+  })));
+  const units = runs.flatMap(run => splitByBoundary(run.text, /(?<=[.!?…])\s+/).map(sentence => ({
+    start: run.start + sentence.start,
+    end: run.start + sentence.end,
+    text: sentence.text,
+    script: run.script,
+    runGuess: run.guess,
+    guess: detectLanguageScored(sentence.text)
+  })));
 
   const totalsByLang = new Map<LangCode, number>();
-  for (const paragraph of paragraphs) {
-    if (paragraph.guess.score > 0) {
-      totalsByLang.set(paragraph.guess.lang, (totalsByLang.get(paragraph.guess.lang) ?? 0) + paragraph.text.length);
+  for (const unit of units) {
+    if (unit.guess.score > 0) {
+      totalsByLang.set(unit.guess.lang, (totalsByLang.get(unit.guess.lang) ?? 0) + unit.text.length);
     }
   }
   let dominant: LangCode = declared ?? "en";
@@ -156,21 +207,21 @@ function buildSegments(text: string, declared: LangCode | null): { segments: Lan
     if (length > dominantLength) { dominantLength = length; dominant = lang; }
   }
 
-  const segments: LangSegment[] = [];
-  for (const paragraph of paragraphs) {
-    const lang = paragraph.guess.score > 0 ? paragraph.guess.lang : dominant;
-    for (const sentence of splitByBoundary(paragraph.text, /(?<=[.!?…])\s+/)) {
-      segments.push({ start: paragraph.start + sentence.start, end: paragraph.start + sentence.end, lang });
-    }
-  }
+  const segments = units.map(unit => ({
+    start: unit.start,
+    end: unit.end,
+    lang: unit.script === "hangul" ? "ko" : unit.script === "cyrillic" ? "ru" :
+      unit.guess.score > 0 ? unit.guess.lang : unit.runGuess.score > 0 ? unit.runGuess.lang : dominant
+  }));
   return { segments, dominant };
 }
 
 function ensureSegments(book: StoredBook) {
-  if (book.segments?.length) return;
+  if (book.segments?.length && book.segmentVersion === SEGMENT_VERSION) return;
   const { segments, dominant } = buildSegments(book.text, normalizeLangCode(book.language) ?? null);
   book.segments = segments;
   book.language = dominant;
+  book.segmentVersion = SEGMENT_VERSION;
 }
 
 // ---------------------------------------------------------------------------
@@ -215,7 +266,7 @@ async function importFile(file?: File) {
     await db.put("books", {
       id, name: file.name, format, position: 0, importedAt: Date.now(),
       title: result.title, author: result.author, text: result.text,
-      language: dominant, segments
+      language: dominant, segments, segmentVersion: SEGMENT_VERSION
     } satisfies StoredBook);
     await renderLibrary("Książka została dodana.");
   } catch (error) {
@@ -333,7 +384,12 @@ function renderReader() {
   app.innerHTML = `<header><button class="ghost" id="back">← Biblioteka</button><div><h1>${escapeHtml(current.title)}</h1><p>${escapeHtml(current.author)}</p></div></header>
     <p class="notice" id="ttsNotice" hidden></p>
     <main class="reader"><article id="article">${article}</article></main>
-    <footer><select id="voice" aria-label="Głos narratora">
+    <footer><select id="genderPreference" aria-label="Preferowany typ głosu">
+        <option value="male" ${voiceGenderPreference === "male" ? "selected" : ""}>Domyślny męski</option>
+        <option value="female" ${voiceGenderPreference === "female" ? "selected" : ""}>Domyślny żeński</option>
+        <option value="none" ${voiceGenderPreference === "none" ? "selected" : ""}>Bez preferencji</option>
+      </select>
+      <select id="voice" aria-label="Głos narratora">
         <option value="auto" ${selectedVoiceURI === "auto" ? "selected" : ""}>${escapeHtml(autoLabel)}</option>
         ${voices.map(voice => `<option value="${escapeHtml(voice.voiceURI)}" ${voice.voiceURI === selectedVoiceURI ? "selected" : ""}>${escapeHtml(voice.name)} · ${voice.lang}${voice.localService ? "" : " · sieciowy"}</option>`).join("")}
       </select>
@@ -341,11 +397,21 @@ function renderReader() {
   document.querySelector<HTMLButtonElement>("#back")!.onclick = () => renderLibrary();
   document.querySelector<HTMLButtonElement>("#play")!.onclick = toggleSpeech;
   document.querySelector<HTMLButtonElement>("#rewind")!.onclick = () => rewind(15);
+  document.querySelector<HTMLSelectElement>("#genderPreference")!.onchange = event => {
+    voiceGenderPreference = (event.target as HTMLSelectElement).value as VoiceGenderPreference;
+    localStorage.setItem("voiceGenderPreference", voiceGenderPreference);
+    selectedVoiceURI = "auto";
+    localStorage.setItem("voiceSelection", selectedVoiceURI);
+    if (speaking) restartFrom(current!.position); else renderReader();
+  };
   document.querySelector<HTMLSelectElement>("#voice")!.onchange = event => {
     selectedVoiceURI = (event.target as HTMLSelectElement).value;
     localStorage.setItem("voiceSelection", selectedVoiceURI);
     if (speaking) restartFrom(current!.position);
   };
+  document.querySelectorAll<HTMLElement>(".sentence").forEach(node => {
+    node.onclick = () => jumpTo(Number(node.dataset.start));
+  });
   document.querySelector(".sentence.current")?.scrollIntoView({ block: "center" });
 }
 
@@ -382,11 +448,30 @@ function persistPosition(position: number) {
 // Prefers a matching, locally-installed voice (reliable) over a matching
 // network voice, and falls back to any locally-installed voice rather than
 // silently picking nothing.
+const MALE_VOICE = /\b(male|man|david|mark|james|daniel|george|guy|ryan|thomas|paul|pablo|diego|jorge|enrique|stefan|hans|henri|yuri|inj[o-]?on|민준|준우)\b/i;
+const FEMALE_VOICE = /\b(female|woman|zira|susan|hazel|samantha|karen|moira|tessa|fiona|victoria|maria|helena|laura|anna|heami|유진|서연)\b/i;
+
+function inferredVoiceGender(voice: SpeechSynthesisVoice): VoiceGenderPreference | null {
+  const label = `${voice.name} ${voice.voiceURI}`;
+  if (MALE_VOICE.test(label)) return "male";
+  if (FEMALE_VOICE.test(label)) return "female";
+  return null;
+}
+
+function preferredVoice(candidates: SpeechSynthesisVoice[]): SpeechSynthesisVoice | null {
+  if (!candidates.length) return null;
+  const genderMatches = voiceGenderPreference === "none"
+    ? candidates
+    : candidates.filter(voice => inferredVoiceGender(voice) === voiceGenderPreference);
+  const pool = genderMatches.length ? genderMatches : candidates;
+  return pool.find(voice => voice.localService) ?? pool[0];
+}
+
 function resolveVoice(lang: string): SpeechSynthesisVoice | null {
   if (!voices.length) return null;
   const prefix = lang.toLowerCase();
   const matches = voices.filter(voice => voice.lang.toLowerCase().startsWith(prefix));
-  return matches.find(voice => voice.localService) ?? matches[0] ?? voices.find(voice => voice.localService) ?? voices[0];
+  return preferredVoice(matches) ?? preferredVoice(voices);
 }
 
 function pickVoice(lang: LangCode): SpeechSynthesisVoice | null {
@@ -481,6 +566,15 @@ function speakSegment(index: number, forceLocal = false) {
 function restartFrom(position: number) {
   speechSynthesis.cancel();
   speakSegment(segmentIndexAt(position));
+}
+
+function jumpTo(position: number) {
+  if (!current || !Number.isFinite(position)) return;
+  const wasSpeaking = speaking;
+  if (wasSpeaking) speechSynthesis.cancel();
+  persistPosition(position);
+  renderReader();
+  if (wasSpeaking) speakSegment(segmentIndexAt(position));
 }
 
 function stopSpeech() {
