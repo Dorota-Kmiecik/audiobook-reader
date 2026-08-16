@@ -1,0 +1,16 @@
+# Android Studio and local machine configuration
+.idea/
+*.iml
+local.properties
+
+# Gradle and Kotlin caches
+.gradle/
+.kotlin/
+**/build/
+
+# Generated build diagnostics
+/*.txt
+
+# OS files
+.DS_Store
+Thumbs.db
